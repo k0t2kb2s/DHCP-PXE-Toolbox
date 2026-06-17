@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PXE DHCP Whitelist</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    >
+  </head>
+  <body class="bg-body-tertiary">
+    <main class="container py-5">
+      <div class="card border-0 shadow-sm">
+        <div class="card-body p-4">
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
+            <div>
+              <h1 class="h3 mb-1">PXE DHCP Whitelist</h1>
+              <p class="text-body-secondary mb-0">Разрешенные MAC-адреса PXE-устройств</p>
+            </div>
+            <span id="count" class="badge text-bg-primary rounded-pill">0</span>
+          </div>
+
+          <div id="alert" class="alert d-none" role="alert"></div>
+
+          <div class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-2 mb-4" id="settings"></div>
+
+          <form id="add-form" class="row g-2 mb-4">
+            <div class="col-sm">
+              <label for="mac" class="visually-hidden">MAC-адрес</label>
+              <input
+                id="mac"
+                class="form-control"
+                type="text"
+                placeholder="aa:bb:cc:dd:ee:ff"
+                autocomplete="off"
+                required
+              >
+            </div>
+            <div class="col-sm-auto">
+              <button class="btn btn-primary w-100" type="submit">Добавить</button>
+            </div>
+          </form>
+
+          <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+              <thead>
+                <tr>
+                  <th scope="col">MAC-адрес</th>
+                  <th scope="col">Вендор</th>
+                  <th scope="col" class="text-end">Действия</th>
+                </tr>
+              </thead>
+              <tbody id="whitelist"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <script>
+      const tableBody = document.getElementById("whitelist");
+      const count = document.getElementById("count");
+      const alertBox = document.getElementById("alert");
+      const settingsBox = document.getElementById("settings");
+      const form = document.getElementById("add-form");
+      const macInput = document.getElementById("mac");
+
+      function showAlert(message, type = "danger") {
+        alertBox.textContent = message;
+        alertBox.className = `alert alert-${type}`;
+      }
+
+      function hideAlert() {
+        alertBox.className = "alert d-none";
+      }
+
+      async function apiRequest(url, options = {}) {
+        const response = await fetch(url, {
+          headers: { "Content-Type": "application/json" },
+          ...options,
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || `Ошибка HTTP ${response.status}`);
+        }
+        return response.json();
+      }
+
+      function render(entries) {
+        tableBody.replaceChildren();
+        count.textContent = entries.length;
+
+        if (entries.length === 0) {
+          const row = tableBody.insertRow();
+          const cell = row.insertCell();
+          cell.colSpan = 3;
+          cell.className = "text-center text-body-secondary py-4";
+          cell.textContent = "Вайтлист пуст";
+          return;
+        }
+
+        for (const entry of entries) {
+          const row = tableBody.insertRow();
+          const macCell = row.insertCell();
+          const vendorCell = row.insertCell();
+          const actionCell = row.insertCell();
+          macCell.textContent = entry.mac;
+          macCell.className = "font-monospace";
+          vendorCell.textContent = entry.vendor;
+          actionCell.className = "text-end";
+
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "btn btn-sm btn-outline-danger";
+          button.textContent = "Удалить";
+          button.addEventListener("click", () => removeMac(entry.mac));
+          actionCell.appendChild(button);
+        }
+      }
+
+      function renderSettings(settings) {
+        const labels = {
+          pool_start: "Начало пула",
+          pool_end: "Конец пула",
+          subnet_mask: "Маска",
+          router: "Шлюз",
+          pxe_next_server: "PXE / TFTP",
+          pxe_boot_file: "Boot-файл",
+        };
+        settingsBox.replaceChildren();
+        for (const [key, label] of Object.entries(labels)) {
+          const column = document.createElement("div");
+          const item = document.createElement("div");
+          const caption = document.createElement("div");
+          const value = document.createElement("div");
+          item.className = "border rounded bg-body p-3 h-100";
+          caption.className = "small text-body-secondary";
+          value.className = "font-monospace";
+          caption.textContent = label;
+          value.textContent = settings[key] || "—";
+          item.append(caption, value);
+          column.appendChild(item);
+          settingsBox.appendChild(column);
+        }
+      }
+
+      async function loadSettings() {
+        try {
+          renderSettings(await apiRequest("/api/settings"));
+        } catch (error) {
+          showAlert(error.message);
+        }
+      }
+
+      async function loadWhitelist() {
+        hideAlert();
+        try {
+          render(await apiRequest("/api/whitelist"));
+        } catch (error) {
+          showAlert(error.message);
+        }
+      }
+
+      async function removeMac(mac) {
+        hideAlert();
+        try {
+          await apiRequest("/api/whitelist", {
+            method: "DELETE",
+            body: JSON.stringify({ mac }),
+          });
+          await loadWhitelist();
+        } catch (error) {
+          showAlert(error.message);
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        hideAlert();
+        try {
+          await apiRequest("/api/whitelist", {
+            method: "POST",
+            body: JSON.stringify({ mac: macInput.value }),
+          });
+          macInput.value = "";
+          await loadWhitelist();
+        } catch (error) {
+          showAlert(error.message);
+        }
+      });
+
+      loadSettings();
+      loadWhitelist();
+      setInterval(loadSettings, 5000);
+    </script>
+  </body>
+</html>
