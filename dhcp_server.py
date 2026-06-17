@@ -3,13 +3,16 @@ from __future__ import annotations
 import ipaddress
 import logging
 import platform
+import re
+import socket
 import subprocess
 import sys
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, FrozenSet, Optional, Set, Tuple, Union
+from typing import Any, Dict, FrozenSet, Optional, Set, Tuple, Union
 
 from config_store import ConfigError, ConfigStore, normalize_mac
 
@@ -34,6 +37,8 @@ except PermissionError as exc:  # pragma: no cover - depends on deployment envir
 
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_LEASE_TIME = 3600
+INTERFACE_NAME_RE = re.compile(r"^[A-Za-z0-9_.:@#() \-]{1,128}$")
 
 
 class LeasePoolExhausted(RuntimeError):
@@ -52,32 +57,101 @@ class NetworkDiscoveryResult:
     observed_ips: FrozenSet[ipaddress.IPv4Address]
 
 
+@dataclass
+class LeaseRecord:
+    ip: str
+    mac: str
+    timestamp: float
+
+
+def get_lease_time(settings: Dict[str, Any]) -> int:
+    try:
+        lease_time = int(settings.get("lease_time", DEFAULT_LEASE_TIME))
+    except (TypeError, ValueError):
+        return DEFAULT_LEASE_TIME
+    return max(60, lease_time)
+
+
+def build_reserved_ips(
+    settings: Dict[str, Any],
+    network: ipaddress.IPv4Network,
+    extra_reserved: Set[ipaddress.IPv4Address],
+) -> Set[ipaddress.IPv4Address]:
+    reserved = {
+        network.network_address,
+        network.broadcast_address,
+    } | set(extra_reserved)
+    for key in ("router", "pxe_next_server"):
+        address = parse_usable_ipv4(settings.get(key))
+        if address:
+            reserved.add(address)
+    return reserved
+
+
 class LeaseAllocator:
     def __init__(self) -> None:
-        self._leases: dict[str, str] = {}
+        self._leases_by_ip: Dict[str, LeaseRecord] = {}
         self._lock = threading.Lock()
 
-    def allocate(self, mac: str, settings: dict[str, Any]) -> str:
+    def allocate(
+        self,
+        mac: str,
+        settings: Dict[str, Any],
+        reserved_ips: Optional[Set[ipaddress.IPv4Address]] = None,
+    ) -> str:
+        normalized_mac = normalize_mac(mac)
         start = ipaddress.IPv4Address(settings["pool_start"])
         end = ipaddress.IPv4Address(settings["pool_end"])
+        network = ipaddress.IPv4Network(
+            f"{settings['pool_start']}/{settings['subnet_mask']}", strict=False
+        )
+        lease_time = get_lease_time(settings)
+        reserved = build_reserved_ips(settings, network, reserved_ips or set())
+        now = time.time()
+
         with self._lock:
-            current = self._leases.get(mac)
-            if current and start <= ipaddress.IPv4Address(current) <= end:
-                return current
+            self._purge_expired(now, lease_time)
+
+            for ip, lease in list(self._leases_by_ip.items()):
+                if lease.mac != normalized_mac:
+                    continue
+                address = ipaddress.IPv4Address(ip)
+                if start <= address <= end and address not in reserved:
+                    lease.timestamp = now
+                    return ip
+                del self._leases_by_ip[ip]
 
             used = {
-                ipaddress.IPv4Address(ip)
-                for lease_mac, ip in self._leases.items()
-                if lease_mac != mac
+                ipaddress.IPv4Address(ip) for ip in self._leases_by_ip
             }
             candidate = start
             while candidate <= end:
-                if candidate not in used:
-                    self._leases[mac] = str(candidate)
+                if candidate not in used and candidate not in reserved:
+                    self._leases_by_ip[str(candidate)] = LeaseRecord(
+                        ip=str(candidate),
+                        mac=normalized_mac,
+                        timestamp=now,
+                    )
                     return str(candidate)
                 candidate += 1
 
         raise LeasePoolExhausted("В DHCP-пуле не осталось свободных адресов")
+
+    def snapshot(self) -> Dict[str, Dict[str, Union[str, float]]]:
+        with self._lock:
+            return {
+                ip: {"mac": lease.mac, "timestamp": lease.timestamp}
+                for ip, lease in self._leases_by_ip.items()
+            }
+
+    def _purge_expired(self, now: float, lease_time: int) -> None:
+        expired = [
+            ip
+            for ip, lease in self._leases_by_ip.items()
+            if now - lease.timestamp >= lease_time
+        ]
+        for ip in expired:
+            del self._leases_by_ip[ip]
 
 
 def get_dhcp_message_type(packet: Any) -> Optional[str]:
@@ -110,12 +184,44 @@ def parse_usable_ipv4(value: Any) -> Optional[ipaddress.IPv4Address]:
     return address
 
 
+def validate_interface_name(interface: str) -> str:
+    if not isinstance(interface, str):
+        raise ValueError("Имя интерфейса должно быть строкой")
+    normalized = interface.strip()
+    if not normalized:
+        raise ValueError("Имя интерфейса не может быть пустым")
+    if normalized.startswith("-"):
+        raise ValueError("Имя интерфейса не может начинаться с '-'")
+    if not INTERFACE_NAME_RE.fullmatch(normalized):
+        raise ValueError(
+            "Имя интерфейса содержит недопустимые символы. Разрешены буквы, "
+            "цифры, пробелы, '.', '_', '-', ':', '@', '#', '(' и ')'."
+        )
+    return normalized
+
+
 def extract_source_ip(packet: Any) -> Optional[ipaddress.IPv4Address]:
     if packet.haslayer(IP):
         return parse_usable_ipv4(packet[IP].src)
     if packet.haslayer(ARP):
         return parse_usable_ipv4(packet[ARP].psrc)
     return None
+
+
+def route_to_interface_network(route: Any, interface: str) -> Optional[ipaddress.IPv4Network]:
+    if len(route) < 5 or str(route[3]) != interface:
+        return None
+    address = parse_usable_ipv4(route[4])
+    if not address:
+        return None
+    try:
+        mask = int(route[1])
+        if mask == 0:
+            return None
+        netmask = ipaddress.IPv4Address(mask)
+        return ipaddress.IPv4Network(f"{address}/{netmask}", strict=False)
+    except (ValueError, TypeError):
+        return None
 
 
 def get_interface_ipv4s(
@@ -131,29 +237,81 @@ def get_interface_ipv4s(
     return preferred, addresses
 
 
-def choose_network(
+def get_interface_networks(interface: str) -> Set[ipaddress.IPv4Network]:
+    networks: Set[ipaddress.IPv4Network] = set()
+    for route in conf.route.routes:
+        network = route_to_interface_network(route, interface)
+        if network:
+            networks.add(network)
+    return networks
+
+
+def infer_network_from_observed_ips(
     observed_ips: Set[ipaddress.IPv4Address],
     current_ip: Optional[ipaddress.IPv4Address],
 ) -> ipaddress.IPv4Network:
-    counts = Counter(
-        ipaddress.IPv4Network(f"{address}/24", strict=False) for address in observed_ips
-    )
-    current_network = (
-        ipaddress.IPv4Network(f"{current_ip}/24", strict=False) if current_ip else None
-    )
-
-    if not counts:
-        if current_network:
-            return current_network
+    if not observed_ips:
+        if current_ip:
+            return ipaddress.IPv4Network(f"{current_ip}/24", strict=False)
         raise NetworkDiscoveryError(
             "За время прослушивания не найдено IP/ARP-трафика и интерфейс не имеет IPv4"
         )
 
-    largest_group = max(counts.values())
-    candidates = [network for network, count in counts.items() if count == largest_group]
-    if current_network in candidates:
-        return current_network
-    return min(candidates, key=lambda network: int(network.network_address))
+    octet8_groups = Counter(
+        ipaddress.IPv4Network((int(address), 8), strict=False)
+        for address in observed_ips
+    )
+    if current_ip:
+        current_octet8 = ipaddress.IPv4Network((int(current_ip), 8), strict=False)
+        if current_octet8 in octet8_groups:
+            candidate_ips = {
+                address for address in observed_ips if address in current_octet8
+            }
+        else:
+            candidate_ips = set(observed_ips)
+    else:
+        dominant_octet8 = max(
+            octet8_groups,
+            key=lambda network: (octet8_groups[network], -int(network.network_address)),
+        )
+        candidate_ips = {address for address in observed_ips if address in dominant_octet8}
+
+    low = min(int(address) for address in candidate_ips)
+    high = max(int(address) for address in candidate_ips)
+    common_prefix = 32 - (low ^ high).bit_length()
+    prefix = min(24, common_prefix)
+    return ipaddress.IPv4Network((low, prefix), strict=False)
+
+
+def choose_network(
+    observed_ips: Set[ipaddress.IPv4Address],
+    current_ip: Optional[ipaddress.IPv4Address],
+    known_networks: Optional[Set[ipaddress.IPv4Network]] = None,
+) -> ipaddress.IPv4Network:
+    known_networks = known_networks or set()
+    if known_networks:
+        if observed_ips:
+            candidates = [
+                (
+                    sum(1 for address in observed_ips if address in network),
+                    bool(current_ip and current_ip in network),
+                    network.prefixlen,
+                    -int(network.network_address),
+                    network,
+                )
+                for network in known_networks
+            ]
+            candidates = [candidate for candidate in candidates if candidate[0] > 0]
+            if candidates:
+                return max(candidates, key=lambda candidate: candidate[:4])[4]
+        if current_ip:
+            containing_current = [
+                network for network in known_networks if current_ip in network
+            ]
+            if containing_current:
+                return max(containing_current, key=lambda network: network.prefixlen)
+
+    return infer_network_from_observed_ips(observed_ips, current_ip)
 
 
 def choose_server_ip(
@@ -182,6 +340,74 @@ def choose_server_ip(
     raise NetworkDiscoveryError("Не удалось подобрать свободный адрес для PXE-сервера")
 
 
+def set_reuseaddr_on_socket(super_socket: Any) -> None:
+    for attr in ("ins", "outs", "socket"):
+        raw_socket = getattr(super_socket, attr, None)
+        if raw_socket and hasattr(raw_socket, "setsockopt"):
+            try:
+                raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                LOGGER.debug("Не удалось выставить SO_REUSEADDR для %s", attr, exc_info=True)
+
+
+def open_reusable_l2_socket(interface: str, bpf_filter: str, promisc: bool = False) -> Any:
+    safe_interface = validate_interface_name(interface)
+    listen_socket = conf.L2listen(
+        iface=safe_interface,
+        filter=bpf_filter,
+        promisc=promisc,
+    )
+    set_reuseaddr_on_socket(listen_socket)
+    return listen_socket
+
+
+def sniff_packets(
+    interface: str,
+    bpf_filter: str,
+    prn: Any,
+    timeout: Optional[int] = None,
+    promisc: bool = False,
+    stop_filter: Optional[Any] = None,
+) -> None:
+    listen_socket = open_reusable_l2_socket(interface, bpf_filter, promisc)
+    try:
+        sniff(
+            opened_socket=listen_socket,
+            prn=prn,
+            store=False,
+            timeout=timeout,
+            stop_filter=stop_filter,
+        )
+    finally:
+        try:
+            listen_socket.close()
+        except Exception:
+            LOGGER.debug("Не удалось закрыть L2 listen socket", exc_info=True)
+
+
+def build_dhcp_autoconfig_settings(
+    network: ipaddress.IPv4Network,
+    router: ipaddress.IPv4Address,
+    server_ip: ipaddress.IPv4Address,
+) -> Dict[str, str]:
+    first_usable = network.network_address + 1
+    last_usable = network.broadcast_address - 1
+    desired_start = network.network_address + 100
+    desired_end = network.network_address + 200
+    pool_start = desired_start if desired_start <= last_usable else first_usable
+    pool_end = min(desired_end, last_usable)
+    if pool_start > pool_end:
+        raise NetworkDiscoveryError(f"Сеть {network} слишком мала для DHCP-пула")
+
+    return {
+        "pool_start": str(pool_start),
+        "pool_end": str(pool_end),
+        "subnet_mask": str(network.netmask),
+        "router": str(router),
+        "pxe_next_server": str(server_ip),
+    }
+
+
 class DHCPServer:
     def __init__(
         self,
@@ -190,10 +416,12 @@ class DHCPServer:
         discovery_timeout: int = 10,
     ) -> None:
         self.config_store = ConfigStore(config_path)
-        self.interface = interface or str(conf.iface)
+        self.interface = validate_interface_name(interface or str(conf.iface))
         self.discovery_timeout = discovery_timeout
         self.allocator = LeaseAllocator()
         self._stop_event = threading.Event()
+        self._reserved_ips_lock = threading.Lock()
+        self._reserved_ips: Set[ipaddress.IPv4Address] = set()
 
     def serve_forever(self) -> None:
         try:
@@ -219,11 +447,10 @@ class DHCPServer:
         )
         LOGGER.info("DHCP-сервер слушает интерфейс %s, UDP-порт 67", self.interface)
         try:
-            sniff(
-                iface=self.interface,
-                filter="udp and dst port 67",
+            sniff_packets(
+                interface=self.interface,
+                bpf_filter="udp and dst port 67",
                 prn=self.handle_packet,
-                store=False,
                 stop_filter=lambda _: self._stop_event.is_set(),
             )
         except PermissionError as exc:
@@ -251,11 +478,10 @@ class DHCPServer:
             self.discovery_timeout,
         )
         try:
-            sniff(
-                iface=self.interface,
-                filter="ip or arp",
+            sniff_packets(
+                interface=self.interface,
+                bpf_filter="ip or arp",
                 prn=collect_source_ip,
-                store=False,
                 timeout=self.discovery_timeout,
                 promisc=True,
             )
@@ -268,12 +494,13 @@ class DHCPServer:
 
         try:
             preferred_ip, interface_ips = get_interface_ipv4s(self.interface)
+            interface_networks = get_interface_networks(self.interface)
         except Exception as exc:
             raise NetworkDiscoveryError(
                 f"Не удалось прочитать IPv4 интерфейса {self.interface}: {exc}"
             ) from exc
         current_hint = preferred_ip or min(interface_ips, default=None)
-        network = choose_network(observed_ips, current_hint)
+        network = choose_network(observed_ips, current_hint, interface_networks)
         current_ip = (
             preferred_ip
             if preferred_ip and preferred_ip in network
@@ -285,14 +512,15 @@ class DHCPServer:
         router = self.detect_router(network, observed_ips)
         server_ip = choose_server_ip(network, current_ip, router, observed_ips)
         self.assign_interface_ip(network, current_ip, server_ip)
+        with self._reserved_ips_lock:
+            self._reserved_ips = set(observed_ips) | {
+                network.network_address,
+                network.broadcast_address,
+                router,
+                server_ip,
+            }
 
-        settings = {
-            "pool_start": str(network.network_address + 100),
-            "pool_end": str(network.network_address + 200),
-            "subnet_mask": str(network.netmask),
-            "router": str(router),
-            "pxe_next_server": str(server_ip),
-        }
+        settings = build_dhcp_autoconfig_settings(network, router, server_ip)
         self.config_store.update_dhcp_settings(settings)
         return NetworkDiscoveryResult(network, router, server_ip, frozenset(observed_ips))
 
@@ -358,7 +586,11 @@ class DHCPServer:
                 LOGGER.info("Silent Drop DHCPDISCOVER от %s", mac)
                 return
 
-            offered_ip = self.allocator.allocate(mac, config["dhcp_settings"])
+            with self._reserved_ips_lock:
+                reserved_ips = set(self._reserved_ips)
+            offered_ip = self.allocator.allocate(
+                mac, config["dhcp_settings"], reserved_ips=reserved_ips
+            )
             offer = self.build_offer(packet, offered_ip, config["dhcp_settings"])
             sendp(offer, iface=self.interface, verbose=False)
             LOGGER.info("Отправлен DHCPOFFER: %s -> %s", mac, offered_ip)
@@ -408,6 +640,7 @@ class DHCPServer:
 def build_assign_ip_command(
     interface: str, server_ip: ipaddress.IPv4Address, network: ipaddress.IPv4Network
 ) -> list[str]:
+    safe_interface = validate_interface_name(interface)
     system = platform.system().lower()
     if system == "windows":
         return [
@@ -416,20 +649,20 @@ def build_assign_ip_command(
             "ip",
             "set",
             "address",
-            f"name={interface}",
+            f"name={safe_interface}",
             "static",
             str(server_ip),
             str(network.netmask),
         ]
     if system == "darwin":
-        return ["ifconfig", interface, "alias", str(server_ip), str(network.netmask)]
+        return ["ifconfig", safe_interface, "alias", str(server_ip), str(network.netmask)]
     return [
         "ip",
         "address",
         "replace",
         f"{server_ip}/{network.prefixlen}",
         "dev",
-        interface,
+        safe_interface,
     ]
 
 

@@ -1,7 +1,7 @@
 {
   "dhcp_settings": {
     "pool_start": "192.168.56.100",
-    "pool_end": "192.168.56.200",
+    "pool_end": "192.168.56.199",
     "subnet_mask": "255.255.255.0",
     "router": "192.168.56.1",
     "pxe_next_server": "192.168.56.50",
@@ -11,6 +11,7 @@
     "aa:bb:cc:dd:ee:ff",
     "e4:a8:df:c1:6a:ba",
     "ea:af:2b:cf:5f:ba",
-    "67:c2:e2:2c:05:63"
+    "67:c2:e2:2c:05:63",
+    "3c:e0:72:a4:bc:9f"
   ]
 }

@@ -12,12 +12,15 @@ from dhcp_server import (
     LeaseAllocator,
     NetworkDiscoveryError,
     build_assign_ip_command,
+    build_dhcp_autoconfig_settings,
     choose_network,
     extract_client_mac,
     extract_source_ip,
     get_dhcp_message_type,
     is_network_discovery_runtime_error,
     run_cli,
+    set_reuseaddr_on_socket,
+    validate_interface_name,
 )
 
 
@@ -71,6 +74,19 @@ def test_choose_dominant_network_and_current_ip_tiebreaker():
     assert choose_network(tied, IPv4Address("10.0.0.50")) == IPv4Network("10.0.0.0/24")
 
 
+def test_choose_network_can_infer_wider_than_24():
+    observed = {IPv4Address("192.168.0.15"), IPv4Address("192.168.1.50")}
+
+    assert choose_network(observed, None) == IPv4Network("192.168.0.0/23")
+
+
+def test_choose_network_prefers_known_interface_network():
+    observed = {IPv4Address("10.20.30.15")}
+    known_networks = {IPv4Network("10.20.30.0/23")}
+
+    assert choose_network(observed, None, known_networks) == IPv4Network("10.20.30.0/23")
+
+
 def test_choose_network_fails_without_traffic_or_interface_ip():
     with pytest.raises(NetworkDiscoveryError):
         choose_network(set(), None)
@@ -81,6 +97,40 @@ def test_allocator_keeps_stable_lease():
     assert allocator.allocate("aa:bb:cc:dd:ee:ff", SETTINGS) == "192.168.50.100"
     assert allocator.allocate("11:22:33:44:55:66", SETTINGS) == "192.168.50.101"
     assert allocator.allocate("aa:bb:cc:dd:ee:ff", SETTINGS) == "192.168.50.100"
+
+
+def test_allocator_tracks_ip_to_mac_timestamp_and_reserved_ips(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr("dhcp_server.time.time", lambda: now[0])
+    allocator = LeaseAllocator()
+
+    first = allocator.allocate(
+        "aa:bb:cc:dd:ee:ff",
+        SETTINGS,
+        reserved_ips={IPv4Address("192.168.50.100")},
+    )
+    second = allocator.allocate("11:22:33:44:55:66", SETTINGS)
+    leases = allocator.snapshot()
+
+    assert first == "192.168.50.101"
+    assert second == "192.168.50.100"
+    assert leases["192.168.50.101"] == {
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "timestamp": 1000.0,
+    }
+    assert leases["192.168.50.100"]["mac"] == "11:22:33:44:55:66"
+
+
+def test_allocator_expires_old_leases(monkeypatch):
+    settings = {**SETTINGS, "lease_time": 60}
+    now = [1000.0]
+    monkeypatch.setattr("dhcp_server.time.time", lambda: now[0])
+    allocator = LeaseAllocator()
+
+    assert allocator.allocate("aa:bb:cc:dd:ee:ff", settings) == "192.168.50.100"
+    now[0] = 1061.0
+    assert allocator.allocate("11:22:33:44:55:66", settings) == "192.168.50.100"
+    assert allocator.snapshot()["192.168.50.100"]["mac"] == "11:22:33:44:55:66"
 
 
 def test_offer_contains_pxe_options(monkeypatch, tmp_path):
@@ -112,13 +162,14 @@ def test_network_discovery_updates_config_and_assigns_server_ip(monkeypatch, tmp
     sniff_options = {}
     assigned = []
 
-    def fake_sniff(**kwargs):
+    def fake_sniff_packets(**kwargs):
         sniff_options.update(kwargs)
         kwargs["prn"](IP(src="192.168.1.15"))
         kwargs["prn"](ARP(psrc="192.168.1.80"))
 
-    monkeypatch.setattr("dhcp_server.sniff", fake_sniff)
+    monkeypatch.setattr("dhcp_server.sniff_packets", fake_sniff_packets)
     monkeypatch.setattr("dhcp_server.get_if_addr", lambda _: "0.0.0.0")
+    monkeypatch.setattr("dhcp_server.get_interface_networks", lambda _: set())
     monkeypatch.setattr(
         "dhcp_server.subprocess.run",
         lambda command, **kwargs: assigned.append((command, kwargs)),
@@ -136,7 +187,7 @@ def test_network_discovery_updates_config_and_assigns_server_ip(monkeypatch, tmp
     assert result.server_ip == IPv4Address("192.168.1.50")
     assert sniff_options["timeout"] == 10
     assert sniff_options["promisc"] is True
-    assert sniff_options["filter"] == "ip or arp"
+    assert sniff_options["bpf_filter"] == "ip or arp"
     assert assigned[0][0] == [
         "ip",
         "address",
@@ -160,11 +211,12 @@ def test_network_discovery_reuses_existing_interface_ip(monkeypatch, tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
 
-    def fake_sniff(**kwargs):
+    def fake_sniff_packets(**kwargs):
         kwargs["prn"](IP(src="10.20.30.15"))
 
-    monkeypatch.setattr("dhcp_server.sniff", fake_sniff)
+    monkeypatch.setattr("dhcp_server.sniff_packets", fake_sniff_packets)
     monkeypatch.setattr("dhcp_server.get_if_addr", lambda _: "10.20.30.9")
+    monkeypatch.setattr("dhcp_server.get_interface_networks", lambda _: {IPv4Network("10.20.30.0/24")})
     monkeypatch.setattr(
         "dhcp_server.subprocess.run",
         lambda *args, **kwargs: pytest.fail("ip address add не должен вызываться"),
@@ -236,6 +288,53 @@ def test_build_assign_ip_command_macos(monkeypatch):
     assert command == ["ifconfig", "en0", "alias", "192.168.56.50", "255.255.255.0"]
 
 
+def test_validate_interface_name_rejects_command_injection():
+    assert validate_interface_name("VirtualBox Host-Only Network") == "VirtualBox Host-Only Network"
+    with pytest.raises(ValueError):
+        validate_interface_name("eth0; rm -rf /")
+    with pytest.raises(ValueError):
+        validate_interface_name("-bad")
+    with pytest.raises(ValueError):
+        validate_interface_name("eth0\nbad")
+
+
+def test_build_assign_ip_command_rejects_unsafe_interface(monkeypatch):
+    monkeypatch.setattr("dhcp_server.platform.system", lambda: "Linux")
+
+    with pytest.raises(ValueError):
+        build_assign_ip_command(
+            "eth0;rm -rf /",
+            IPv4Address("192.168.56.50"),
+            IPv4Network("192.168.56.0/24"),
+        )
+
+
+def test_set_reuseaddr_on_socket():
+    calls = []
+
+    class RawSocket:
+        def setsockopt(self, *args):
+            calls.append(args)
+
+    class SuperSocket:
+        ins = RawSocket()
+
+    set_reuseaddr_on_socket(SuperSocket())
+
+    assert calls
+
+
+def test_build_autoconfig_settings_caps_pool_to_network():
+    settings = build_dhcp_autoconfig_settings(
+        IPv4Network("192.168.56.0/25"),
+        IPv4Address("192.168.56.1"),
+        IPv4Address("192.168.56.50"),
+    )
+
+    assert settings["pool_start"] == "192.168.56.100"
+    assert settings["pool_end"] == "192.168.56.126"
+
+
 def test_network_discovery_runtime_error_detection():
     assert is_network_discovery_runtime_error(
         RuntimeError("Автоопределение сети завершилось ошибкой: нет трафика")
@@ -298,13 +397,15 @@ def test_whitelisted_discover_sends_offer(monkeypatch, tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     sent = []
+    server = DHCPServer(path, interface="eth0")
+    server._reserved_ips = {IPv4Address("192.168.50.100")}
     monkeypatch.setattr("dhcp_server.get_if_hwaddr", lambda _: "00:11:22:33:44:55")
     monkeypatch.setattr(
         "dhcp_server.sendp", lambda packet, **kwargs: sent.append((packet, kwargs))
     )
 
-    DHCPServer(path, interface="eth0").handle_packet(discover())
+    server.handle_packet(discover())
 
     assert len(sent) == 1
-    assert sent[0][0][BOOTP].yiaddr == "192.168.50.100"
+    assert sent[0][0][BOOTP].yiaddr == "192.168.50.101"
     assert sent[0][1]["iface"] == "eth0"

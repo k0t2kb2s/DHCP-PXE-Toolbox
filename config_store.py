@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import copy
 import ipaddress
 import json
@@ -28,6 +29,45 @@ class DuplicateMACError(ConfigError):
 
 class MACNotFoundError(ConfigError):
     pass
+
+
+_CONFIG_LOCKS_GUARD = threading.Lock()
+_CONFIG_LOCKS: Dict[Path, threading.RLock] = {}
+
+
+def get_config_lock(path: Union[str, Path]) -> threading.RLock:
+    resolved_path = Path(path).resolve(strict=False)
+    with _CONFIG_LOCKS_GUARD:
+        lock = _CONFIG_LOCKS.get(resolved_path)
+        if lock is None:
+            lock = threading.RLock()
+            _CONFIG_LOCKS[resolved_path] = lock
+        return lock
+
+
+@contextmanager
+def locked_config_file(path: Path):
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def normalize_mac(value: str) -> str:
@@ -98,38 +138,42 @@ def validate_config(config: Any) -> Dict[str, Any]:
 class ConfigStore:
     def __init__(self, path: Union[str, Path]) -> None:
         self.path = Path(path)
-        self._lock = threading.RLock()
+        self._lock = get_config_lock(self.path)
 
     def load(self) -> Dict[str, Any]:
         with self._lock:
-            return self._read_unlocked()
+            with locked_config_file(self.path):
+                return self._read_unlocked()
 
     def add_mac(self, value: str) -> str:
         normalized = normalize_mac(value)
         with self._lock:
-            config = self._read_unlocked()
-            if normalized in config["whitelist"]:
-                raise DuplicateMACError(f"{normalized} уже есть в вайтлисте")
-            config["whitelist"].append(normalized)
-            self._write_unlocked(config)
+            with locked_config_file(self.path):
+                config = self._read_unlocked()
+                if normalized in config["whitelist"]:
+                    raise DuplicateMACError(f"{normalized} уже есть в вайтлисте")
+                config["whitelist"].append(normalized)
+                self._write_unlocked(config)
         return normalized
 
     def remove_mac(self, value: str) -> str:
         normalized = normalize_mac(value)
         with self._lock:
-            config = self._read_unlocked()
-            if normalized not in config["whitelist"]:
-                raise MACNotFoundError(f"{normalized} отсутствует в вайтлисте")
-            config["whitelist"].remove(normalized)
-            self._write_unlocked(config)
+            with locked_config_file(self.path):
+                config = self._read_unlocked()
+                if normalized not in config["whitelist"]:
+                    raise MACNotFoundError(f"{normalized} отсутствует в вайтлисте")
+                config["whitelist"].remove(normalized)
+                self._write_unlocked(config)
         return normalized
 
     def update_dhcp_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
-            config = self._read_unlocked()
-            config["dhcp_settings"].update(settings)
-            self._write_unlocked(config)
-            return copy.deepcopy(config["dhcp_settings"])
+            with locked_config_file(self.path):
+                config = self._read_unlocked()
+                config["dhcp_settings"].update(settings)
+                self._write_unlocked(config)
+                return copy.deepcopy(config["dhcp_settings"])
 
     def _read_unlocked(self) -> Dict[str, Any]:
         try:

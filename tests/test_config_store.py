@@ -2,7 +2,13 @@ import json
 
 import pytest
 
-from config_store import ConfigError, ConfigStore, DuplicateMACError, normalize_mac
+from config_store import (
+    ConfigError,
+    ConfigStore,
+    DuplicateMACError,
+    locked_config_file,
+    normalize_mac,
+)
 
 
 def make_config():
@@ -40,6 +46,24 @@ def test_add_and_remove_mac(tmp_path):
     assert store.load()["whitelist"] == ["aa:bb:cc:dd:ee:ff"]
     assert store.remove_mac("aabb.ccdd.eeff") == "aa:bb:cc:dd:ee:ff"
     assert store.load()["whitelist"] == []
+
+
+def test_stores_for_same_path_share_thread_lock(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(make_config()), encoding="utf-8")
+
+    first = ConfigStore(path)
+    second = ConfigStore(path)
+
+    assert first._lock is second._lock
+
+
+def test_locked_config_file_creates_lock_file(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(make_config()), encoding="utf-8")
+
+    with locked_config_file(path):
+        assert (tmp_path / ".config.json.lock").exists()
 
 
 def test_duplicate_mac_is_rejected(tmp_path):
