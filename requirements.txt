@@ -1,5 +1,4 @@
-fastapi>=0.115,<1.0
-jinja2>=3.1,<4.0
-pydantic>=2.0,<3.0
-scapy>=2.6,<3.0
-uvicorn[standard]>=0.34,<1.0
+scapy==2.7.0
+tftpy==0.8.7
+fastapi==0.138.1
+uvicorn==0.49.0

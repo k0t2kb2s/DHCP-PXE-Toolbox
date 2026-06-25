@@ -1,0 +1,7 @@
+DEFAULT debian_inst
+TIMEOUT 50
+SAY Запуск установки Debian из чистого корня...
+
+LABEL debian_inst
+    KERNEL linux
+    APPEND initrd=initrd.gz quiet ---

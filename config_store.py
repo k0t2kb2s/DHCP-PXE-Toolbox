@@ -82,6 +82,30 @@ def normalize_mac(value: str) -> str:
     return ":".join(compact[index : index + 2] for index in range(0, 12, 2))
 
 
+def normalize_whitelist_entry(entry: Any) -> Dict[str, Any]:
+    if isinstance(entry, str):
+        try:
+            return {"mac": normalize_mac(entry), "pxe_enabled": True}
+        except ValueError as exc:
+            raise ConfigError(f"Некорректный MAC-адрес в whitelist: {entry!r}") from exc
+
+    if not isinstance(entry, dict):
+        raise ConfigError(f"Некорректная запись whitelist: {entry!r}")
+
+    try:
+        normalized_mac = normalize_mac(entry["mac"])
+    except KeyError as exc:
+        raise ConfigError(f"В записи whitelist отсутствует mac: {entry!r}") from exc
+    except ValueError as exc:
+        raise ConfigError(f"Некорректный MAC-адрес в whitelist: {entry!r}") from exc
+
+    pxe_enabled = entry.get("pxe_enabled", True)
+    if not isinstance(pxe_enabled, bool):
+        raise ConfigError(f"pxe_enabled должен быть boolean для {normalized_mac}")
+
+    return {"mac": normalized_mac, "pxe_enabled": pxe_enabled}
+
+
 def validate_config(config: Any) -> Dict[str, Any]:
     if not isinstance(config, dict):
         raise ConfigError("Корень config.json должен быть JSON-объектом")
@@ -121,14 +145,13 @@ def validate_config(config: Any) -> Dict[str, Any]:
     if not isinstance(settings["pxe_boot_file"], str) or not settings["pxe_boot_file"].strip():
         raise ConfigError("pxe_boot_file не может быть пустым")
 
-    normalized_whitelist: list[str] = []
-    for mac in whitelist:
-        try:
-            normalized = normalize_mac(mac)
-        except ValueError as exc:
-            raise ConfigError(f"Некорректный MAC-адрес в whitelist: {mac!r}") from exc
-        if normalized not in normalized_whitelist:
-            normalized_whitelist.append(normalized)
+    normalized_whitelist: list[Dict[str, Any]] = []
+    seen_macs: set[str] = set()
+    for entry in whitelist:
+        normalized_entry = normalize_whitelist_entry(entry)
+        if normalized_entry["mac"] not in seen_macs:
+            normalized_whitelist.append(normalized_entry)
+            seen_macs.add(normalized_entry["mac"])
 
     validated = copy.deepcopy(config)
     validated["whitelist"] = normalized_whitelist
@@ -145,27 +168,48 @@ class ConfigStore:
             with locked_config_file(self.path):
                 return self._read_unlocked()
 
-    def add_mac(self, value: str) -> str:
+    def add_mac(self, value: str, pxe_enabled: bool = True) -> Dict[str, Any]:
         normalized = normalize_mac(value)
+        if not isinstance(pxe_enabled, bool):
+            raise ValueError("pxe_enabled должен быть boolean")
         with self._lock:
             with locked_config_file(self.path):
                 config = self._read_unlocked()
-                if normalized in config["whitelist"]:
+                if any(entry["mac"] == normalized for entry in config["whitelist"]):
                     raise DuplicateMACError(f"{normalized} уже есть в вайтлисте")
-                config["whitelist"].append(normalized)
+                entry = {"mac": normalized, "pxe_enabled": pxe_enabled}
+                config["whitelist"].append(entry)
                 self._write_unlocked(config)
-        return normalized
+        return copy.deepcopy(entry)
 
-    def remove_mac(self, value: str) -> str:
+    def remove_mac(self, value: str) -> Dict[str, Any]:
         normalized = normalize_mac(value)
         with self._lock:
             with locked_config_file(self.path):
                 config = self._read_unlocked()
-                if normalized not in config["whitelist"]:
+                for index, entry in enumerate(config["whitelist"]):
+                    if entry["mac"] == normalized:
+                        removed = config["whitelist"].pop(index)
+                        break
+                else:
                     raise MACNotFoundError(f"{normalized} отсутствует в вайтлисте")
-                config["whitelist"].remove(normalized)
                 self._write_unlocked(config)
-        return normalized
+        return copy.deepcopy(removed)
+
+    def update_mac_pxe(self, value: str, pxe_enabled: bool) -> Dict[str, Any]:
+        normalized = normalize_mac(value)
+        if not isinstance(pxe_enabled, bool):
+            raise ValueError("pxe_enabled должен быть boolean")
+        with self._lock:
+            with locked_config_file(self.path):
+                config = self._read_unlocked()
+                for entry in config["whitelist"]:
+                    if entry["mac"] == normalized:
+                        entry["pxe_enabled"] = pxe_enabled
+                        updated = copy.deepcopy(entry)
+                        self._write_unlocked(config)
+                        return updated
+                raise MACNotFoundError(f"{normalized} отсутствует в вайтлисте")
 
     def update_dhcp_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:

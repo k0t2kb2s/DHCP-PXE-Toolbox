@@ -241,7 +241,7 @@ def get_interface_networks(interface: str) -> Set[ipaddress.IPv4Network]:
     networks: Set[ipaddress.IPv4Network] = set()
     for route in conf.route.routes:
         network = route_to_interface_network(route, interface)
-        if network:
+        if network and network.prefixlen < 31:
             networks.add(network)
     return networks
 
@@ -582,7 +582,11 @@ class DHCPServer:
         try:
             mac = extract_client_mac(packet)
             config = self.config_store.load()
-            if mac not in config["whitelist"]:
+            whitelist_entry = next(
+                (entry for entry in config["whitelist"] if entry["mac"] == mac),
+                None,
+            )
+            if whitelist_entry is None:
                 LOGGER.info("Silent Drop DHCPDISCOVER от %s", mac)
                 return
 
@@ -591,7 +595,12 @@ class DHCPServer:
             offered_ip = self.allocator.allocate(
                 mac, config["dhcp_settings"], reserved_ips=reserved_ips
             )
-            offer = self.build_offer(packet, offered_ip, config["dhcp_settings"])
+            offer = self.build_offer(
+                packet,
+                offered_ip,
+                config["dhcp_settings"],
+                pxe_enabled=whitelist_entry["pxe_enabled"],
+            )
             sendp(offer, iface=self.interface, verbose=False)
             LOGGER.info("Отправлен DHCPOFFER: %s -> %s", mac, offered_ip)
         except (ConfigError, LeasePoolExhausted, ValueError, OSError) as exc:
@@ -600,11 +609,30 @@ class DHCPServer:
             LOGGER.exception("Непредвиденная ошибка обработки DHCPDISCOVER")
 
     def build_offer(
-        self, discover: Any, offered_ip: str, settings: dict[str, Any]
+        self,
+        discover: Any,
+        offered_ip: str,
+        settings: dict[str, Any],
+        pxe_enabled: bool = True,
     ) -> Any:
         server_ip = settings["pxe_next_server"]
         server_mac = get_if_hwaddr(self.interface)
         next_server = settings["pxe_next_server"]
+        options = [
+            ("message-type", "offer"),
+            ("server_id", server_ip),
+            ("lease_time", 3600),
+            ("subnet_mask", settings["subnet_mask"]),
+            ("router", settings["router"]),
+        ]
+        if pxe_enabled:
+            options.extend(
+                [
+                    ("tftp_server_name", next_server),
+                    ("boot-file-name", settings["pxe_boot_file"]),
+                ]
+            )
+        options.append("end")
 
         return (
             Ether(src=server_mac, dst="ff:ff:ff:ff:ff:ff")
@@ -617,23 +645,12 @@ class DHCPServer:
                 xid=discover[BOOTP].xid,
                 flags=discover[BOOTP].flags,
                 yiaddr=offered_ip,
-                siaddr=next_server,
+                siaddr=next_server if pxe_enabled else "0.0.0.0",
                 giaddr=discover[BOOTP].giaddr,
                 chaddr=discover[BOOTP].chaddr,
-                file=settings["pxe_boot_file"],
+                file=settings["pxe_boot_file"] if pxe_enabled else "",
             )
-            / DHCP(
-                options=[
-                    ("message-type", "offer"),
-                    ("server_id", server_ip),
-                    ("lease_time", 3600),
-                    ("subnet_mask", settings["subnet_mask"]),
-                    ("router", settings["router"]),
-                    ("tftp_server_name", next_server),
-                    ("boot-file-name", settings["pxe_boot_file"]),
-                    "end",
-                ]
-            )
+            / DHCP(options=options)
         )
 
 

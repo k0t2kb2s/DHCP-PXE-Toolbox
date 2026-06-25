@@ -19,12 +19,14 @@ from config_store import (
     DuplicateMACError,
     MACNotFoundError,
 )
+from tftp_core import TFTPServer
 from vendor_db import load_manuf, lookup_vendor
 
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", BASE_DIR / "config.json"))
 MANUF_PATH = Path(os.getenv("MANUF_PATH", BASE_DIR / "manuf"))
+TFTP_ROOT = Path(os.getenv("TFTP_ROOT", BASE_DIR / "tftpboot"))
 
 LOGGER = logging.getLogger(__name__)
 config_store = ConfigStore(CONFIG_PATH)
@@ -33,10 +35,12 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 class MACRequest(BaseModel):
     mac: str
+    pxe_enabled: bool = True
 
 
 class WhitelistEntry(BaseModel):
     mac: str
+    pxe_enabled: bool
     vendor: str
 
 
@@ -83,7 +87,18 @@ async def lifespan(app: FastAPI):
 
     app.state.dhcp_server = None
     app.state.dhcp_error = None
-    if os.getenv("DHCP_ENABLED", "").lower() in {"1", "true", "yes", "on"}:
+    app.state.tftp_server = None
+    app.state.tftp_error = None
+
+    dhcp_enabled = os.getenv("DHCP_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+    tftp_enabled = os.getenv("TFTP_ENABLED", "").lower() not in {"0", "false", "no", "off"}
+    if tftp_enabled:
+        tftp_server = TFTPServer(TFTP_ROOT)
+        app.state.tftp_server = tftp_server
+        tftp_server.start()
+        LOGGER.info("Запущен TFTP-поток")
+
+    if dhcp_enabled:
         thread = threading.Thread(target=_run_dhcp, args=(app,), daemon=True, name="dhcp-server")
         thread.start()
         app.state.dhcp_thread = thread
@@ -93,6 +108,8 @@ async def lifespan(app: FastAPI):
 
     if app.state.dhcp_server is not None:
         app.state.dhcp_server.stop()
+    if app.state.tftp_server is not None:
+        app.state.tftp_server.stop()
 
 
 app = FastAPI(title="PXE DHCP Whitelist", lifespan=lifespan)
@@ -112,8 +129,12 @@ async def get_whitelist(request: Request):
 
     vendors = getattr(request.app.state, "vendors", {})
     return [
-        WhitelistEntry(mac=mac, vendor=lookup_vendor(mac, vendors))
-        for mac in config["whitelist"]
+        WhitelistEntry(
+            mac=entry["mac"],
+            pxe_enabled=entry["pxe_enabled"],
+            vendor=lookup_vendor(entry["mac"], vendors),
+        )
+        for entry in config["whitelist"]
     ]
 
 
@@ -206,7 +227,7 @@ def _count_active_leases(server: Any, settings: dict[str, Any]) -> int:
 @app.post("/api/whitelist", response_model=WhitelistEntry, status_code=status.HTTP_201_CREATED)
 async def add_to_whitelist(payload: MACRequest, request: Request):
     try:
-        mac = config_store.add_mac(payload.mac)
+        entry = config_store.add_mac(payload.mac, payload.pxe_enabled)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except DuplicateMACError as exc:
@@ -215,13 +236,18 @@ async def add_to_whitelist(payload: MACRequest, request: Request):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
     vendors = getattr(request.app.state, "vendors", {})
-    return WhitelistEntry(mac=mac, vendor=lookup_vendor(mac, vendors))
+    return WhitelistEntry(
+        mac=entry["mac"],
+        pxe_enabled=entry["pxe_enabled"],
+        vendor=lookup_vendor(entry["mac"], vendors),
+    )
 
 
-@app.delete("/api/whitelist", response_model=WhitelistEntry)
-async def remove_from_whitelist(payload: MACRequest, request: Request):
+@app.put("/api/whitelist", response_model=WhitelistEntry)
+@app.patch("/api/whitelist", response_model=WhitelistEntry)
+async def update_whitelist_entry(payload: MACRequest, request: Request):
     try:
-        mac = config_store.remove_mac(payload.mac)
+        entry = config_store.update_mac_pxe(payload.mac, payload.pxe_enabled)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MACNotFoundError as exc:
@@ -230,7 +256,30 @@ async def remove_from_whitelist(payload: MACRequest, request: Request):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
     vendors = getattr(request.app.state, "vendors", {})
-    return WhitelistEntry(mac=mac, vendor=lookup_vendor(mac, vendors))
+    return WhitelistEntry(
+        mac=entry["mac"],
+        pxe_enabled=entry["pxe_enabled"],
+        vendor=lookup_vendor(entry["mac"], vendors),
+    )
+
+
+@app.delete("/api/whitelist", response_model=WhitelistEntry)
+async def remove_from_whitelist(payload: MACRequest, request: Request):
+    try:
+        entry = config_store.remove_mac(payload.mac)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except MACNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ConfigError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+    vendors = getattr(request.app.state, "vendors", {})
+    return WhitelistEntry(
+        mac=entry["mac"],
+        pxe_enabled=entry["pxe_enabled"],
+        vendor=lookup_vendor(entry["mac"], vendors),
+    )
 
 
 if __name__ == "__main__":

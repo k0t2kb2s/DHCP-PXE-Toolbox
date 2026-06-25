@@ -3,3 +3,9 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 .*.lock
+.venv/
+__pycache__/
+tftpboot/linux
+tftpboot/initrd.gz
+tftpboot/debian-installer/
+netboot.tar.gz

@@ -277,6 +277,20 @@
             >
           </div>
           <div class="col-lg-auto d-flex align-items-end">
+            <div class="form-check form-switch pb-2">
+              <input
+                id="pxe-enabled"
+                class="form-check-input"
+                type="checkbox"
+                role="switch"
+                checked
+              >
+              <label class="form-check-label" for="pxe-enabled">
+                Грузить Linux по сети (PXE)
+              </label>
+            </div>
+          </div>
+          <div class="col-lg-auto d-flex align-items-end">
             <button class="btn btn-cyber btn-lg w-100 px-4" type="submit">Добавить</button>
           </div>
         </form>
@@ -287,6 +301,7 @@
               <tr>
                 <th scope="col">MAC-адрес</th>
                 <th scope="col">Вендор</th>
+                <th scope="col">PXE Boot</th>
                 <th scope="col" class="text-end">Действия</th>
               </tr>
             </thead>
@@ -368,6 +383,7 @@
       const settingsBox = document.getElementById("settings");
       const form = document.getElementById("add-form");
       const macInput = document.getElementById("mac");
+      const pxeInput = document.getElementById("pxe-enabled");
       const statusDot = document.getElementById("status-dot");
       const dhcpStatus = document.getElementById("dhcp-status");
       const poolCaption = document.getElementById("pool-caption");
@@ -443,7 +459,7 @@
         if (entries.length === 0) {
           const row = tableBody.insertRow();
           const cell = row.insertCell();
-          cell.colSpan = 3;
+          cell.colSpan = 4;
           cell.className = "text-center text-secondary py-5";
           cell.textContent = "Вайтлист пуст. Пока сюда никто не пройдет.";
           return;
@@ -454,10 +470,12 @@
           row.style.animationDelay = `${index * 35}ms`;
           const macCell = row.insertCell();
           const vendorCell = row.insertCell();
+          const pxeCell = row.insertCell();
           const actionCell = row.insertCell();
           macCell.textContent = entry.mac;
           macCell.className = "font-monospace fw-semibold";
           vendorCell.appendChild(vendorBadge(entry));
+          pxeCell.appendChild(pxeSwitch(entry));
           actionCell.className = "text-end";
 
           const button = document.createElement("button");
@@ -467,6 +485,22 @@
           button.addEventListener("click", () => openDeleteModal(entry.mac));
           actionCell.appendChild(button);
         }
+      }
+
+      function pxeSwitch(entry) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "form-check form-switch mb-0";
+
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.className = "form-check-input";
+        input.setAttribute("role", "switch");
+        input.checked = entry.pxe_enabled;
+        input.setAttribute("aria-label", `PXE Boot для ${entry.mac}`);
+        input.addEventListener("change", () => updatePxe(entry.mac, input.checked, input));
+
+        wrapper.appendChild(input);
+        return wrapper;
       }
 
       function renderSettings(settings) {
@@ -563,15 +597,39 @@
         }
       }
 
+      async function updatePxe(mac, pxeEnabled, input) {
+        hideAlert();
+        input.disabled = true;
+        try {
+          await apiRequest("/api/whitelist", {
+            method: "PUT",
+            body: JSON.stringify({ mac, pxe_enabled: pxeEnabled }),
+          });
+          showAlert(
+            `${mac}: PXE ${pxeEnabled ? "включен" : "выключен"}`,
+            "success"
+          );
+        } catch (error) {
+          input.checked = !pxeEnabled;
+          showAlert(error.message);
+        } finally {
+          input.disabled = false;
+        }
+      }
+
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
         hideAlert();
         try {
           await apiRequest("/api/whitelist", {
             method: "POST",
-            body: JSON.stringify({ mac: macInput.value }),
+            body: JSON.stringify({
+              mac: macInput.value,
+              pxe_enabled: pxeInput.checked,
+            }),
           });
           macInput.value = "";
+          pxeInput.checked = true;
           await loadWhitelist();
           showAlert("MAC добавлен в whitelist", "success");
         } catch (error) {
